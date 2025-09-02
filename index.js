@@ -1,19 +1,26 @@
 require('dotenv').config();
 const express = require('express');
 const africastalking_api = require('africastalking');
+const axios = require('axios');
+const moment = require('moment');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const bodyParser = require('body-parser');
+const mongoose = require('mongoose');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Trust the first proxy (needed for ngrok and rate limiting)
+app.set('trust proxy', 1);
+
 // Verify required environment variables
-const requiredEnvVars = ['AFRICASTALKING_API_KEY', 'AFRICASTALKING_USERNAME'];
+const requiredEnvVars = ['AFRICASTALKING_API_KEY', 'AFRICASTALKING_USERNAME', 'MONGODB_URI'];
 for (const envVar of requiredEnvVars) {
   if (!process.env[envVar]) {
     console.error(`Missing required environment variable: ${envVar}`);
+    console.error('Make sure you have a .env file with these values before starting the server.');
     process.exit(1);
   }
 }
@@ -35,19 +42,115 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// Middleware to parse JSON and URL-encoded bodies
-app.use(express.json());
+// Parse JSON only for application/json, and urlencoded for form data
+app.use(express.json({ limit: '1mb' }));
 app.use(bodyParser.urlencoded({ extended: false }));
+
+// Debug middleware: log headers and parsed body for every request
+app.use((req, res, next) => {
+  console.log('--- Incoming Request ---');
+  console.log('Headers:', req.headers);
+  console.log('Parsed body:', req.body);
+  next();
+});
+
+// --- MongoDB connection and transaction model ---
+async function connectDB() {
+  try {
+    await mongoose.connect(process.env.MONGODB_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+      serverSelectionTimeoutMS: 10000
+    });
+    console.log('✅ MongoDB connected');
+  } catch (err) {
+    console.error('❌ MongoDB connection error:', err.message || err);
+    process.exit(1);
+  }
+}
+
+const transactionSchema = new mongoose.Schema(
+  {
+    merchantRequestId: String,
+    checkoutRequestId: String,
+    resultCode: Number,
+    resultDesc: String,
+
+    amount: Number,
+    mpesaReceiptNumber: String,
+    phoneNumber: String,
+    transactionDate: String, // keep format as Daraja returns (yyyymmddHHMMSS)
+
+    rawCallback: mongoose.Schema.Types.Mixed // full payload
+  },
+  { timestamps: true }
+);
+
+const Transaction = mongoose.model('Transaction', transactionSchema);
+
+// Helper: initiate STK Push (uses env variables, falls back to sensible placeholders)
+async function initiateStkPush(phone, amount, { accountRef = 'BimaWater', transactionDesc = 'Water Bill Payment' } = {}) {
+  // Read Daraja / Safaricom credentials from env
+  const SHORTCODE = process.env.DARAJA_SHORTCODE || '60000';
+  const PASSKEY = process.env.DARAJA_PASSKEY || 'bfb279f9aa9bdbcf15e97dd71a467cd2bfb279f9aa9bdbcf15e97dd71a467cd2';
+  const CONSUMER_KEY = process.env.SAFARICOM_CONSUMER_KEY || '';
+  const CONSUMER_SECRET = process.env.SAFARICOM_CONSUMER_SECRET || '';
+  const CALLBACK_URL = process.env.DARAJA_CALLBACK_URL || (process.env.NGROK_URL ? `${process.env.NGROK_URL}/daraja-callback` : 'https://your-callback-url.example.com/daraja-callback');
+
+  if (!CONSUMER_KEY || !CONSUMER_SECRET) {
+    throw new Error('Missing SAFARICOM_CONSUMER_KEY or SAFARICOM_CONSUMER_SECRET in environment variables');
+  }
+
+  // Normalize phone to 2547XXXXXXXX or 254 prefix expected by Daraja
+  let formattedPhone = phone.replace(/[^0-9]/g, '');
+  if (!formattedPhone.startsWith('254')) {
+    // assume user entered local number like 07XXXXXXXX
+    if (formattedPhone.startsWith('0')) {
+      formattedPhone = '254' + formattedPhone.slice(1);
+    }
+  }
+
+  const timestamp = moment().format('YYYYMMDDHHmmss');
+  const password = Buffer.from(SHORTCODE + PASSKEY + timestamp).toString('base64');
+
+  // get access token
+  const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString('base64');
+  const tokenRes = await axios.get('https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials', {
+    headers: { Authorization: `Basic ${auth}` }
+  });
+  const accessToken = tokenRes.data.access_token;
+
+  // call STK Push
+  const payload = {
+    BusinessShortCode: SHORTCODE,
+    Password: password,
+    Timestamp: timestamp,
+    TransactionType: 'CustomerPayBillOnline',
+    Amount: amount,
+    PartyA: formattedPhone,
+    PartyB: SHORTCODE,
+    PhoneNumber: formattedPhone,
+    CallBackURL: CALLBACK_URL,
+    AccountReference: accountRef,
+    TransactionDesc: transactionDesc
+  };
+
+  const stkRes = await axios.post('https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest', payload, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+
+  return stkRes.data; // caller inspects ResponseCode / CheckoutRequestID etc.
+}
 
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });
 
-// SMS endpoint
+// SMS endpoint (unchanged)
 app.post('/send-sms', async (req, res) => {
   const { phoneNumber, message = 'Default message from Africastalking' } = req.body;
-  
+
   if (!phoneNumber) {
     return res.status(400).json({ 
       status: 'error',
@@ -83,7 +186,7 @@ app.post('/send-sms', async (req, res) => {
   }
 });
 
-// USSD endpoint
+// USSD endpoint (keeps behaviour, but uses initiateStkPush helper and improved validation)
 app.post('/ussd', async (req, res) => {
   const {
     phoneNumber,
@@ -102,71 +205,152 @@ app.post('/ussd', async (req, res) => {
   let response = '';
   const textArray = text.split('*');
   const lastInput = textArray[textArray.length - 1];
+  let smsToSend = null;
+  let smsMessage = '';
 
-  // USSD menu logic
+  // USSD Water Management Menu
   if (text === '') {
-    // First screen
-    response = `CON Welcome to our service
-    1. Register
-    2. Check Balance
-    3. Help`;
+    response = `CON Welcome to Bima.\n1. Meter Reading\n2. Pay Water Bill\n3. Report Issue\n0. Exit`;
   } else if (text === '1') {
-    // Registration menu
-    response = `CON Enter your full name`;
-  } else if (text.startsWith('1*')) {
-    if (textArray.length === 2) {
-      // Got name, ask for email
-      response = `CON Enter your email address`;
-    } else if (textArray.length === 3) {
-      // Complete registration
-      const name = textArray[1];
-      const email = lastInput;
-      
-      // Send confirmation SMS
+    const usage = '12,500 Litres';
+    response = `END Your current water consumption is ${usage}.`;
+  } else if (text === '2') {
+    response = `CON Enter amount to pay:`;
+  } else if (text.startsWith('2*')) {
+    const amount = textArray[1];
+    if (!amount || isNaN(amount)) {
+      response = `END Invalid amount entered.`;
+    } else {
+      // Initiate STK Push
       try {
-        await africastalking.SMS.send({
-          to: phoneNumber,
-          message: `Thank you ${name} for registering! We'll contact you at ${email}`,
-          from: "AFTKNG"
-        });
-        
-        response = `END Thank you for registering. You'll receive an SMS confirmation.`;
-      } catch (error) {
-        console.error('SMS sending error:', error);
-        response = `END Registration complete but failed to send SMS.`;
-        
+        const stkResp = await initiateStkPush(phoneNumber, amount, { accountRef: 'BimaWater', transactionDesc: 'Water Bill Payment' });
+
+        // Daraja returns ResponseCode (string) === '0' on success
+        if (stkResp && (stkResp.ResponseCode === '0' || stkResp.ResponseCode === 0)) {
+          response = `END STK Push initiated. Complete payment on your phone.`;
+        } else {
+          console.error('STK Push failed response:', stkResp);
+          response = `END Failed to initiate payment. Try again later.`;
+        }
+      } catch (err) {
+        console.error('Daraja STK Push error:', (err.response && err.response.data) || err.message || err);
+        response = `END Payment request failed. Please try again later.`;
       }
     }
-  } else if (text === '2') {
-    // Check balance
-    const balance = "KES 1,500"; // This would come from your database
-    
-    // Send balance via SMS
+  } else if (text === '3') {
+    response = `CON Which issue are you reporting:\n1. Water outage\n2. Pipe leakage`;
+  } else if (text.startsWith('3*')) {
+    const issueOption = textArray[1];
+    let issueType = '';
+    if (issueOption === '1') {
+      issueType = 'Water outage';
+    } else if (issueOption === '2') {
+      issueType = 'Pipe leakage';
+    }
+    if (issueType) {
+      response = `END Thank you for reporting: ${issueType}. Our team will address it shortly.`;
+      smsToSend = phoneNumber; // Reporting user
+      smsMessage = `ALERT: Household ${phoneNumber} reported a '${issueType}'. Please investigate.`;
+    } else {
+      response = `END Invalid issue option selected.`;
+    }
+  } else if (text === '0') {
+    response = `END Thank you for using Bima.`;
+  } else {
+    response = `END Invalid option selected.`;
+  }
+
+  // Send SMS alert for issue reporting
+  if (response.startsWith('END') && smsToSend && smsMessage) {
+    try {
+      await africastalking.SMS.send({
+        to: smsToSend,
+        message: smsMessage
+      });
+      console.log(`SMS sent to ${smsToSend}: ${smsMessage}`);
+    } catch (error) {
+      console.error('SMS sending error:', error);
+    }
+  }
+
+  // Send SMS with the last message shown to the user at the end of every USSD session
+  if (response.startsWith('END')) {
     try {
       await africastalking.SMS.send({
         to: phoneNumber,
-        message: `Your current balance is ${balance}`
+        message: response.replace(/^END\s*/, '') // Remove "END " prefix from message
       });
-      
-      response = `END Your balance details have been sent via SMS.`;
+      console.log(`USSD session end message sent to ${phoneNumber}: ${response}`);
     } catch (error) {
-      console.error('SMS sending error:', error);
-      response = `END Your balance is ${balance}. Failed to send SMS.`;
+      console.error('SMS sending error for USSD session end message:', error);
     }
-  } else if (text === '3') {
-    // Help
-    response = `END Contact support at help@example.com or call +254700000000`;
-  } else {
-    response = `END Invalid option selected`;
   }
 
   res.set('Content-Type', 'text/plain');
   res.send(response);
 });
 
-// Start server
-app.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
+// Daraja callback endpoint (saves transaction to MongoDB)
+app.post('/daraja-callback', async (req, res) => {
+  try {
+    // Daraja wraps the payload under Body.stkCallback
+    const body = (req.body && req.body.Body && req.body.Body.stkCallback) ? req.body.Body.stkCallback : null;
+    if (!body) {
+      console.warn('Received daraja callback with unexpected structure:', req.body);
+      // respond 200 so Safaricom doesn't retry infinitely
+      return res.status(200).json({ status: 'ignored' });
+    }
+
+    const merchantRequestId = body.MerchantRequestID;
+    const checkoutRequestId = body.CheckoutRequestID;
+    const resultCode = Number(body.ResultCode);
+    const resultDesc = body.ResultDesc;
+
+    const itemsArray = (body.CallbackMetadata && body.CallbackMetadata.Item) ? body.CallbackMetadata.Item : [];
+    const items = itemsArray.reduce((acc, it) => {
+      if (it && it.Name) acc[it.Name] = it.Value;
+      return acc;
+    }, {});
+
+    const doc = await Transaction.create({
+      merchantRequestId,
+      checkoutRequestId,
+      resultCode,
+      resultDesc,
+      amount: Number(items.Amount) || 0,
+      mpesaReceiptNumber: items.MpesaReceiptNumber || null,
+      phoneNumber: items.PhoneNumber || null,
+      transactionDate: items.TransactionDate || null,
+      rawCallback: req.body
+    });
+
+    console.log('💾 Saved transaction:', doc._id.toString());
+
+    // Respond quickly
+    res.status(200).json({ status: 'success' });
+  } catch (err) {
+    console.error('Error handling daraja callback:', err);
+    // Still return 200 to prevent Daraja retries; log for debugging
+    res.status(200).json({ status: 'error' });
+  }
+});
+
+// Simple route to view recent transactions
+app.get('/transactions', async (req, res) => {
+  try {
+    const rows = await Transaction.find().sort({ createdAt: -1 }).limit(50);
+    res.json(rows);
+  } catch (err) {
+    console.error('Error fetching transactions:', err);
+    res.status(500).json({ status: 'error' });
+  }
+});
+
+// Start server after DB connection
+connectDB().then(() => {
+  app.listen(port, () => {
+    console.log(`Server is running on port ${port}`);
+  });
 });
 
 // Error handling
