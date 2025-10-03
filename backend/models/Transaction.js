@@ -13,6 +13,8 @@ const transactionSchema = new mongoose.Schema(
     phoneNumber: String,
     transactionDate: String, // keep as string from callback (yyyymmddHHMMSS)
 
+    provider: String, // 'daraja' or 'intasend'
+
     rawCallback: Object, // full payload for audit/debug
   },
   { timestamps: true }

@@ -88,20 +88,19 @@ const transactionSchema = new mongoose.Schema(
 
 const Transaction = mongoose.model('Transaction', transactionSchema);
 
-// Helper: initiate STK Push (uses env variables, falls back to sensible placeholders)
+// Helper: initiate STK Push using Intasend API
 async function initiateStkPush(phone, amount, { accountRef = 'BimaWater', transactionDesc = 'Water Bill Payment' } = {}) {
-  // Read Daraja / Safaricom credentials from env
-  const SHORTCODE = process.env.DARAJA_SHORTCODE || '60000';
-  const PASSKEY = process.env.DARAJA_PASSKEY || 'bfb279f9aa9bdbcf15e97dd71a467cd2bfb279f9aa9bdbcf15e97dd71a467cd2';
-  const CONSUMER_KEY = process.env.SAFARICOM_CONSUMER_KEY || '';
-  const CONSUMER_SECRET = process.env.SAFARICOM_CONSUMER_SECRET || '';
-  const CALLBACK_URL = process.env.DARAJA_CALLBACK_URL || (process.env.NGROK_URL ? `${process.env.NGROK_URL}/daraja-callback` : 'https://your-callback-url.example.com/daraja-callback');
+  // Read Intasend credentials from env
+  const PUBLIC_KEY = process.env.INTASEND_PUBLIC_KEY || '';
+  const PRIVATE_KEY = process.env.INTASEND_PRIVATE_KEY || '';
+  const TEST_MODE = process.env.INTASEND_TEST_MODE === 'true';
+  const WEBHOOK_URL = process.env.INTASEND_WEBHOOK_URL || (process.env.NGROK_URL ? `${process.env.NGROK_URL}/daraja-callback` : 'https://your-callback-url.example.com/daraja-callback');
 
-  if (!CONSUMER_KEY || !CONSUMER_SECRET) {
-    throw new Error('Missing SAFARICOM_CONSUMER_KEY or SAFARICOM_CONSUMER_SECRET in environment variables');
+  if (!PUBLIC_KEY || !PRIVATE_KEY) {
+    throw new Error('Missing INTASEND_PUBLIC_KEY or INTASEND_PRIVATE_KEY in environment variables');
   }
 
-  // Normalize phone to 2547XXXXXXXX or 254 prefix expected by Daraja
+  // Normalize phone to 2547XXXXXXXX or 254 prefix expected by Intasend
   let formattedPhone = phone.replace(/[^0-9]/g, '');
   if (!formattedPhone.startsWith('254')) {
     // assume user entered local number like 07XXXXXXXX
@@ -110,36 +109,25 @@ async function initiateStkPush(phone, amount, { accountRef = 'BimaWater', transa
     }
   }
 
-  const timestamp = moment().format('YYYYMMDDHHmmss');
-  const password = Buffer.from(SHORTCODE + PASSKEY + timestamp).toString('base64');
-
-  // get access token
-  const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString('base64');
-  const tokenRes = await axios.get('https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials', {
-    headers: { Authorization: `Basic ${auth}` }
-  });
-  const accessToken = tokenRes.data.access_token;
-
-  // call STK Push
+  // call Intasend STK Push
   const payload = {
-    BusinessShortCode: SHORTCODE,
-    Password: password,
-    Timestamp: timestamp,
-    TransactionType: 'CustomerPayBillOnline',
-    Amount: amount,
-    PartyA: formattedPhone,
-    PartyB: SHORTCODE,
-    PhoneNumber: formattedPhone,
-    CallBackURL: CALLBACK_URL,
-    AccountReference: accountRef,
-    TransactionDesc: transactionDesc
+    public_key: PUBLIC_KEY,
+    private_key: PRIVATE_KEY,
+    test_mode: TEST_MODE,
+    amount: amount,
+    phone_number: formattedPhone,
+    api_ref: accountRef + '-' + Date.now(),
+    webhook_url: WEBHOOK_URL
   };
 
-  const stkRes = await axios.post('https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest', payload, {
-    headers: { Authorization: `Bearer ${accessToken}` }
+  const stkRes = await axios.post('https://sandbox.intasend.com/api/v1/payment/mpesa-stk-push/', payload, {
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${PRIVATE_KEY}`
+    }
   });
 
-  return stkRes.data; // caller inspects ResponseCode / CheckoutRequestID etc.
+  return stkRes.data; // caller inspects invoice object
 }
 
 // Health check endpoint
@@ -168,7 +156,8 @@ app.post('/send-sms', async (req, res) => {
   try {
     const result = await africastalking.SMS.send({
       to: phoneNumber,
-      message: message
+      message: message,
+      from: 'Bima'
     });
 
     res.status(200).json({
@@ -225,15 +214,15 @@ app.post('/ussd', async (req, res) => {
       try {
         const stkResp = await initiateStkPush(phoneNumber, amount, { accountRef: 'BimaWater', transactionDesc: 'Water Bill Payment' });
 
-        // Daraja returns ResponseCode (string) === '0' on success
-        if (stkResp && (stkResp.ResponseCode === '0' || stkResp.ResponseCode === 0)) {
+        // Intasend returns invoice object on success
+        if (stkResp && stkResp.invoice) {
           response = `END STK Push initiated. Complete payment on your phone.`;
         } else {
           console.error('STK Push failed response:', stkResp);
           response = `END Failed to initiate payment. Try again later.`;
         }
       } catch (err) {
-        console.error('Daraja STK Push error:', (err.response && err.response.data) || err.message || err);
+        console.error('STK Push error:', (err.response && err.response.data) || err.message || err);
         response = `END Payment request failed. Please try again later.`;
       }
     }
@@ -265,7 +254,8 @@ app.post('/ussd', async (req, res) => {
     try {
       await africastalking.SMS.send({
         to: smsToSend,
-        message: smsMessage
+        message: smsMessage,
+        from: 'Bima'
       });
       console.log(`SMS sent to ${smsToSend}: ${smsMessage}`);
     } catch (error) {
@@ -278,7 +268,8 @@ app.post('/ussd', async (req, res) => {
     try {
       await africastalking.SMS.send({
         to: phoneNumber,
-        message: response.replace(/^END\s*/, '') // Remove "END " prefix from message
+        message: response.replace(/^END\s*/, ''), // Remove "END " prefix from message
+        from: 'Bima'
       });
       console.log(`USSD session end message sent to ${phoneNumber}: ${response}`);
     } catch (error) {
@@ -290,47 +281,67 @@ app.post('/ussd', async (req, res) => {
   res.send(response);
 });
 
-// Daraja callback endpoint (saves transaction to MongoDB)
+// Callback endpoint for STK Push (handles both Daraja and Intasend)
 app.post('/daraja-callback', async (req, res) => {
   try {
-    // Daraja wraps the payload under Body.stkCallback
-    const body = (req.body && req.body.Body && req.body.Body.stkCallback) ? req.body.Body.stkCallback : null;
-    if (!body) {
-      console.warn('Received daraja callback with unexpected structure:', req.body);
-      // respond 200 so Safaricom doesn't retry infinitely
-      return res.status(200).json({ status: 'ignored' });
+    let merchantRequestId, checkoutRequestId, resultCode, resultDesc, amount, mpesaReceiptNumber, phoneNumber, transactionDate, provider;
+
+    if (req.body.invoice) {
+      // Intasend callback
+      const body = req.body.invoice;
+      merchantRequestId = body.invoice_id;
+      checkoutRequestId = body.intasend_tracking_id;
+      resultCode = body.state === 'COMPLETE' ? 0 : (body.state === 'FAILED' ? 1 : 2);
+      resultDesc = body.failed_reason || 'Success';
+      amount = Number(body.value);
+      mpesaReceiptNumber = body.mpesa_reference;
+      phoneNumber = body.customer_phone_number;
+      transactionDate = body.updated_at;
+      provider = 'intasend';
+    } else {
+      // Daraja callback
+      const body = (req.body && req.body.Body && req.body.Body.stkCallback) ? req.body.Body.stkCallback : null;
+      if (!body) {
+        console.warn('Received callback with unexpected structure:', req.body);
+        return res.status(200).json({ status: 'ignored' });
+      }
+
+      merchantRequestId = body.MerchantRequestID;
+      checkoutRequestId = body.CheckoutRequestID;
+      resultCode = Number(body.ResultCode);
+      resultDesc = body.ResultDesc;
+
+      const itemsArray = (body.CallbackMetadata && body.CallbackMetadata.Item) ? body.CallbackMetadata.Item : [];
+      const items = itemsArray.reduce((acc, it) => {
+        if (it && it.Name) acc[it.Name] = it.Value;
+        return acc;
+      }, {});
+
+      amount = Number(items.Amount) || 0;
+      mpesaReceiptNumber = items.MpesaReceiptNumber || null;
+      phoneNumber = items.PhoneNumber || null;
+      transactionDate = items.TransactionDate || null;
+      provider = 'daraja';
     }
-
-    const merchantRequestId = body.MerchantRequestID;
-    const checkoutRequestId = body.CheckoutRequestID;
-    const resultCode = Number(body.ResultCode);
-    const resultDesc = body.ResultDesc;
-
-    const itemsArray = (body.CallbackMetadata && body.CallbackMetadata.Item) ? body.CallbackMetadata.Item : [];
-    const items = itemsArray.reduce((acc, it) => {
-      if (it && it.Name) acc[it.Name] = it.Value;
-      return acc;
-    }, {});
 
     const doc = await Transaction.create({
       merchantRequestId,
       checkoutRequestId,
       resultCode,
       resultDesc,
-      amount: Number(items.Amount) || 0,
-      mpesaReceiptNumber: items.MpesaReceiptNumber || null,
-      phoneNumber: items.PhoneNumber || null,
-      transactionDate: items.TransactionDate || null,
+      amount,
+      mpesaReceiptNumber,
+      phoneNumber,
+      transactionDate,
+      provider,
       rawCallback: req.body
     });
 
     console.log('💾 Saved transaction:', doc._id.toString());
 
-    // Respond quickly
     res.status(200).json({ status: 'success' });
   } catch (err) {
-    console.error('Error handling daraja callback:', err);
-    // Still return 200 to prevent Daraja retries; log for debugging
+    console.error('Error handling callback:', err);
     res.status(200).json({ status: 'error' });
   }
 });
